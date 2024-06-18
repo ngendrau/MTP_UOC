@@ -1,0 +1,502 @@
+---
+title: "Unraveling the immunogenic landscape of TNBC"
+subtitle: "InferCNV on a Seurat Object" 
+author: "Nuria Gendrau-Sanclemente"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: cosmo
+    highlight: pygments
+    df_print: paged
+    code_folding: hide
+    fig_align: center
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: yes
+---
+
+```{r setup}
+library(tidyverse)
+library(infercnv)
+library(Seurat)
+library(zellkonverter)
+library(Matrix)
+library(glue)
+library(here)
+```
+
+# Data preparation
+
+To call CNV, we will use the `infercnv` package. The idea is pretty simple: we need to create a CNV object called `CreateInfercnvObject()` and then apply the `run()` function of the `infercnv` on it.
+
+To create the **Infercnv Object** with the `CreateInfercnvObject()`, there are different data that we have to provide the function with:
+
+- `raw_counts_matrix`: it is a matrix or a file that contains the raw counts of gene expression. Rows are the genes; and columns are the individual cells. This information is stored in the @assays@RNA@counts part of the Seurat object.
+
+- `annotations_file`: it is a file that consists of a table with 2 columns that matches the name of each column in `raw_counts_matrix` (which will be the *exact name* of each cell, metacell or patient, and may contain different parts separated by "_", for example) - this would be the 1st column in this table - ; with the actual *cell type* - this would be the 2nd column of this table -.
+
+- `gene_order_file`: this is a 4-column file that provides a list of all genes, the chromosome where they are located, and the positions of start and end per gene. It is very important for this file that the gene positions are **in increasing order**.
+
+- `ref_group_names`: this is a vector with the *exact same* names of the cell types that have to be used by the function as "control" or "reference" cells
+
+Therefore, in this first "Data preparation" part, we need to prepare all these different pieces of data to provide the function `CreateInfercnvObject()` with.
+
+## Raw counts matrix
+
+Load the Seurat Object.
+
+```{r}
+so <- readRDS("multimodalAnnotatedFinal.rds")
+so
+```
+This is an updated version of the Seurat object, with more annotations:
+
+```{r}
+so2 <- readRDS("updatedProjected.rds")
+so2
+```
+
+This is the downsampled object to speed up analysis iterations:
+
+```{r}
+library(scMiko)
+so2_downsampled <- downsampleSeurat(
+  so2,
+  subsample.factor = 0.15,
+  subsample.n = NULL,
+  sample.group = NULL,
+  min.group.size = 500,
+  seed = 1023,
+  verbose = T
+)
+```
+
+```{r}
+so2_downsampled %>% class
+```
+
+We can have a look at the structure of the Seurat Object:
+
+```{r}
+so2 %>% str
+```
+
+We see that the **count matrix** is stored in @assays@RNA@counts and it has cells as columns (35054) and genes as rows (called "features", there are 32285 genes).
+
+```{r}
+so@assays$RNA
+```
+
+```{r}
+so2@assays$RNA
+```
+
+```{r}
+so2_downsampled@assays$RNA
+```
+
+Manually access the data. From now on we will work with the updated object:
+
+```{r}
+counts_matrix <- so2@assays$RNA@counts[,colnames(so2)]
+```
+
+```{r}
+counts_matrix_downsampled <- so2_downsampled$RNA@counts[,colnames(so2_downsampled)]
+```
+
+These are the cell names in our actual counts_matrix:
+
+```{r}
+colnames(counts_matrix) %>% head
+```
+
+```{r}
+colnames(counts_matrix_downsampled) %>% head
+```
+
+We may want to add a more informative column about cells, indicating for example to which sample they belong to.
+
+```{r}
+so2@meta.data %>% colnames
+```
+These are the sample names:
+
+```{r}
+so2@meta.data$orig.ident %>% table
+```
+
+```{r}
+so2@meta.data$orig.ident %>% table
+```
+
+These are the cell types:
+
+```{r}
+so2@meta.data$new_cell_type %>% table
+```
+
+```{r}
+so2_downsampled@meta.data$new_cell_type %>% table
+```
+
+These are the experimental conditions:
+
+```{r}
+so2@meta.data$exp %>% table
+```
+
+```{r}
+so2_downsampled@meta.data$exp %>% table
+```
+
+Create a `group_label` column with all these informations together along with the cell name:
+
+```{r}
+cell_names_so2 <- colnames(counts_matrix) 
+metadata_so2 <- so2@meta.data
+metadata_so2 <- metadata_so2 %>%
+  mutate(group_label = paste(cell_names_so2, orig.ident, exp, new_cell_type, sep = "_"))
+metadata_so2$group_label %>% head
+```
+
+```{r}
+cell_names_so2_downsampled <- colnames(counts_matrix_downsampled) 
+metadata_so2_downsampled <- so2_downsampled@meta.data
+metadata_so2_downsampled <- metadata_so2_downsampled %>%
+  mutate(group_label_downsampled = paste(cell_names_so2_downsampled, orig.ident, exp, new_cell_type, sep = "_"))
+metadata_so2_downsampled$group_label_downsampled %>% head
+```
+
+Create a vector with the `group_label` information:
+
+```{r}
+group_label_for_matrix <- metadata_so2$group_label
+```
+
+```{r}
+group_label_for_matrix_downsampled <- metadata_so2_downsampled$group_label_downsampled
+```
+
+```{r}
+length(group_label_for_matrix)
+```
+
+```{r}
+length(group_label_for_matrix_downsampled)
+```
+
+```{r}
+counts_matrix %>% class
+```
+
+The `counts_matrix` is sparse, and although apparently it can be provided to the inferCNV object creation function, I will convert it into a dense matrix.
+
+```{r}
+counts_matrix_dense <- as.matrix(counts_matrix)
+```
+
+```{r}
+counts_matrix_dense_downsampled <- as.matrix(counts_matrix_downsampled)
+```
+
+```{r}
+colnames(counts_matrix_dense) %>% head
+```
+
+```{r}
+counts_matrix_dense %>% dim %>% table
+```
+
+```{r}
+counts_matrix_dense_downsampled %>% dim %>% table
+```
+
+Assign new, more informative, colnames to our matrix:
+
+```{r}
+colnames(counts_matrix_dense) <- group_label_for_matrix
+colnames(counts_matrix_dense) %>% head
+```
+
+```{r}
+colnames(counts_matrix_dense_downsampled) <- group_label_for_matrix_downsampled
+colnames(counts_matrix_dense_downsampled) %>% head
+```
+
+Create and save matrix counts file
+
+```{r}
+prefix <- "/path/"
+counts_matrix_filename <- paste0(prefix, "counts_matrix_so2.tsv")
+counts_matrix_filename_downsampled <- paste0(prefix, "counts_matrix_so2_downsampled.tsv")
+write.table(counts_matrix_dense, file = counts_matrix_filename, sep = "\t", row.names = TRUE, quote = F)
+write.table(counts_matrix_dense_downsampled, file = counts_matrix_filename_downsampled, sep = "\t", row.names = TRUE, quote = F)
+
+```
+
+## Gene order file
+
+create now the gene order file
+
+```{r}
+keep_chrs <- paste0(c(1:19, "X"))
+
+genes_mouse <- read.table("Mouse_gene_names.txt", header = F, sep = "\t")
+genes_mouse$V2 %>% table
+```
+We need the genes table to be arranged by order of chr and position. We will remove M and Y chrs as well.
+
+```{r}
+genes_mouse_arranged <- genes_mouse %>%
+  mutate(
+    V2 = str_remove(V2, "chr")) %>%
+  filter(V2 != "M") %>%
+  filter(V2 != "Y") %>%
+  mutate(V2 = factor(V2, levels = keep_chrs)) %>%
+  arrange(V2, V3)
+
+genes_mouse_arranged %>% head
+```
+See how many genes do we have per chromosome:
+
+```{r}
+genes_mouse_arranged$V2 %>% table
+```
+
+See how many genes do we have:
+
+```{r}
+genes_mouse_arranged %>% dim %>% table
+```
+
+We have to check for the overlapping genes:
+
+```{r}
+genes_mouse_arranged$V1 %in% rownames(counts_matrix) %>% table
+```
+
+```{r}
+genes_mouse_arranged <- genes_mouse_arranged[(genes_mouse_arranged$V1 %in% rownames(counts_matrix)),]
+genes_mouse_arranged %>% dim %>% table
+```
+
+After removing the non-overlapping genes we end up with 31161 genes that are also in our count matrix. Now we can save the table.
+
+```{r}
+genes_filename <- paste0(prefix, "genes_mouse.tsv")
+write.table(genes_mouse_arranged, file = genes_filename, sep = "\t", row.names = F, col.names = F, quote = F)
+```
+
+## Annotations file
+
+Regarding the `annotations_file` we need to provide one table that contains the matching cell information with cell type information.
+
+```{r}
+so2@meta.data$new_cell_type %>% unique
+```
+
+
+```{r}
+so2@meta.data$new_cell_type %>% table
+```
+
+```{r}
+so2@meta.data$new_cell_type %>% length()
+```
+
+```{r}
+colnames(counts_matrix_dense) %>% length()
+```
+
+```{r}
+so2_downsampled@meta.data$new_cell_type %>% length()
+```
+
+```{r}
+colnames(counts_matrix_dense_downsampled) %>% length()
+```
+
+```{r}
+anno_imaxt_so2 <- data.frame(group_label_for_matrix, so2@meta.data$new_cell_type)
+colnames(anno_imaxt_so2) <- c("cell_label", "new_cell_type")
+rownames(anno_imaxt_so2) <- anno_imaxt_so2$cell_label
+anno_imaxt_so2 %>% head
+```
+
+```{r}
+anno_imaxt_so2_downsampled <- data.frame(group_label_for_matrix_downsampled, so2_downsampled@meta.data$new_cell_type)
+colnames(anno_imaxt_so2_downsampled) <- c("cell_label", "new_cell_type")
+rownames(anno_imaxt_so2_downsampled) <- anno_imaxt_so2_downsampled$cell_label
+anno_imaxt_so2_downsampled %>% head
+```
+
+Check that all cell_name are present in the matrix
+
+```{r}
+all(anno_imaxt_so2$cell_label %in% colnames(counts_matrix_dense))
+```
+
+```{r}
+all(anno_imaxt_so2_downsampled$cell_label %in% colnames(counts_matrix_dense_downsampled))
+```
+
+Create the file now
+
+```{r}
+annotations_filename <- paste0(prefix, "annotations_imaxt_so2.tsv")
+write.table(anno_imaxt_so2, file = annotations_filename, sep = "\t", row.names = F, col.names = F, quote = F)
+```
+
+```{r}
+annotations_filename_downsampled <- paste0(prefix, "annotations_imaxt_so2_downsampled.tsv")
+write.table(anno_imaxt_so2_downsampled, file = annotations_filename_downsampled, sep = "\t", row.names = F, col.names = F, quote = F)
+```
+
+## Ref group names vector
+
+One option would be to consider all cell types that are non-tumoral, individually, as reference cell types:
+
+```{r}
+ref_group_cell_types_imaxt <- grep(pattern = "Cancer", 
+                             x = unique(so2@meta.data$new_cell_type), 
+                             invert = T, 
+                             value = T)
+ref_group_cell_types_imaxt
+```
+
+# infercnv Function
+
+## Load package
+
+```{r}
+library(infercnv)
+```
+
+## Create infercnv object
+
+Now we have all data ready to create the **infercnv Object** with the `CreateInfercnvObject()` function. In the `delim` arg we have to tell the function that our files are separated by tabulator "\t" spaces.
+
+```{r}
+infercnv_obj = CreateInfercnvObject(
+  raw_counts_matrix=counts_matrix_filename,
+  annotations_file=annotations_filename,
+  delim="\t",
+  gene_order_file=genes_filename,
+  ref_group_names=bcells)
+```
+*Looks like it worked, but provides warning "Please use `options(scipen = 100)` before running infercnv if you are using the `analysis_mode="subclusters"` option or you may encounter an error while the hclust is being generated".
+
+```{r}
+options(scipen = 100)
+```
+
+```{r}
+infercnv_obj %>% str
+```
+
+```{r}
+infercnv_obj_downsampled = CreateInfercnvObject(
+  raw_counts_matrix=counts_matrix_filename_downsampled,
+  annotations_file=annotations_filename_downsampled,
+  delim="\t",
+  gene_order_file=genes_filename,
+  ref_group_names=ref_group_cell_types_imaxt)
+```
+
+```{r}
+infercnv_obj_downsampled %>% str
+```
+
+```{r}
+plot_cnv(infercnv_obj,
+         out_dir='/path/infercnv_output_2', 
+         output_filename='plotcnv1', 
+         x.range="auto", 
+         title = "infercnv_obj@expr.data", 
+         color_safe_pal = FALSE, 
+         x.center = mean(infercnv_obj@expr.data))
+```
+
+
+## Run infercnv
+
+### `cutoff` parameter
+
+Before running `infercnv::run`, there are some considerations that must be made, being one of them the **cutoff parameter** that we have to provide the function with. To know which value we have to put there, we will have to look at the **average counts per gene** in those cell types that are in the **reference cell groups**.
+
+That is why, first, we create a vector `ref_cells` that selects those elements in the column "group_label" (so we will get each "metacell" name in a vector) corresponding to those of the column "cell_type" that are comprised in `ref_group_cell_types` that has been defined previously. 
+
+```{r}
+# Check the average per gene expression in the reference group
+ref_cells_imaxt <- anno_imaxt_so2[anno_imaxt_so2$new_cell_type %in% ref_group_cell_types_imaxt, "cell_label"]
+ref_cells_imaxt %>% head
+```
+
+```{r}
+# Check the average per gene expression in the reference group
+ref_bcells <- anno_imaxt_so2[anno_imaxt_so2$new_cell_type %in% bcells, "cell_label"]
+ref_bcells %>% head
+```
+
+We are basically saving all "group_label"s of the reference cell types in a vector, because then, we can apply `rowMeans` to `grouped_matrix_dense`, only to those columns that match the names comprised in the vector `ref_cells`. 
+
+And we save it in a numeric vector called `ref_per_gene_avg_exp`:
+
+```{r}
+ref_per_gene_avg_exp_imaxt <- rowMeans(counts_matrix_dense[,ref_cells_imaxt])
+ref_per_gene_avg_exp_imaxt %>% head
+```
+
+```{r}
+ref_per_gene_avg_exp_bcells <- rowMeans(counts_matrix_dense[,ref_bcells])
+ref_per_gene_avg_exp_bcells %>% head
+```
+
+Now we can plot it:
+
+```{r}
+qplot(log10(ref_per_gene_avg_exp_imaxt))
+```
+
+```{r}
+qplot(log10(ref_per_gene_avg_exp_bcells))
+```
+
+And get a summary:
+
+```{r}
+summary(ref_per_gene_avg_exp_imaxt)
+```
+
+```{r}
+summary(ref_per_gene_avg_exp_bcells)
+```
+
+If the average counts were fairly high per gene, for example with a minimum of 3 and an average of 27 as it was with the NSCLC example dataset, this would inform the use of the cutoff parameter = 1 in infercnv::run. However, here we have a minimum of 0 and an average of 0.27. We will set 0.1 as cutoff.
+
+### Other parameters
+
+- `cluster_by_groups`: we set `TRUE`. If observations are defined according to groups (i.e. patients) each group of cells will be clustered separately. Default is FALSE, and instead it will use `k_obs_groups` setting, which is the number of groups in which to break the observations and default is 1.
+
+- `denoise`: we set `TRUE`. If so, it turns on "denoising", according to:
+  - `noise_filter`: values +- from the reference cell mean will be set to zero (whitening effect) default is NA, instead will use `sd_amplifier` below.
+  - `sd_amplifier`: noise is defined as mean(reference_cells) +- sdev(reference_cells) * `sd_amplifier` default: 1.5.
+  - `noise_logistic`: use the `noise_filter` or `sd_amplifier` based threshold (whichever is invoked) as the midpoint in a logistic model for downscaling values close to the mean. (default: FALSE).
+
+- `HMM`: we set `TRUE`. When `HMM` = `TRUE` it runs HMM to predict CNV level, default is FALSE.
+
+### Run function
+
+`run()` invokes a routine inferCNV analysis to infer CNV changes given a matrix of RNAseq counts. It is the function doing the actual analysis before calling the plotting functions.
+
+```{r}
+infercnv_obj = infercnv::run(
+  infercnv_obj,
+  cutoff=0.1, #cutoff for the min average read counts per gene among reference cells, default = 1, which works well for Smart-seq2; and cutoff=0.1 works well for 10x Genomics.
+  out_dir='/path/infercnv_output_2',
+  cluster_by_groups=TRUE,
+  denoise=TRUE,
+  HMM=TRUE)
+```
