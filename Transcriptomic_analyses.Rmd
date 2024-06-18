@@ -1,0 +1,1951 @@
+---
+title: "Unraveling the immunogenomic landscape of TNBC"
+subtitle: "Transcriptomic analyses" 
+author: "Nuria Gendrau-Sanclemente"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: cosmo
+    highlight: pygments
+    df_print: paged
+    code_folding: hide
+    fig_align: center
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: yes
+---
+
+```{r}
+library(argparse)
+library(SingleCellExperiment)
+library(DropletUtils)
+library(scuttle)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(dsb)
+library(tibble)
+library(cowplot)
+library(pheatmap)
+library(stringr)
+library(readxl)
+library(fgsea)
+library(tibble)
+library(scran)
+library(scater)
+library(glue)
+library(org.Hs.eg.db)
+library(readr)
+library(UCell)
+library(reshape)
+library(scclusteval)
+library(miloR)
+library(edgeR)
+library(limma)
+library(patchwork)
+library(magrittr)
+library(viridis)
+library(scCustomize)
+library(qs)
+library(anndata)
+library(LoomExperiment)
+library(reticulate)
+library(sceasy)
+library(zellkonverter)
+library(patchwork)
+library(SeuratData)
+library(harmony)
+library(BiocManager)
+library(Nebulosa)
+library(crossmatch)
+library(multicross)
+library(SCPA)
+library(msigdbr)
+```
+
+# All cells
+
+The first thing we have to do is to load the `h5ad` object that we've saved after inferring CNV. We'll start using data from **all cells**:
+
+```{r}
+adata <- anndata::read_h5ad("adata_post_infercnv.h5ad")
+```
+
+Explore it. We get the same output that we see in Python.
+
+```{r}
+adata
+```
+
+```{r}
+metadata <- adata$obs %>% as.data.frame()
+seurat_obj <- CreateSeuratObject(counts = adata$X,
+                                  meta.data = metadata,
+                                  assay = "RNA",
+                                  min.cells = 3, min.features = 200)
+```
+
+Cell names are stored in `seurat_obj@assays$RNA@features@.Data %>% rownames`
+
+```{r}
+seurat_obj@assays$RNA@features@.Data %>% rownames %>% head
+
+```
+
+Our counts matrix is sparse and has 16258 genes (cols) x 40785 cells (rows)
+
+```{r}
+seurat_obj@assays$RNA@layers$counts  %>% dim %>% table
+```
+
+Turn this matrix into a dense one and then add the cell names as rownames:
+
+```{r}
+counts_seurat_dense <- as.matrix(seurat_obj@assays$RNA@layers$counts)
+```
+
+```{r}
+counts_seurat_dense %>% dim %>% table
+```
+
+```{r}
+rownames(counts_seurat_dense) <- rownames(seurat_obj@assays$RNA@features@.Data)
+counts_seurat_dense %>% rownames %>% head
+```
+
+We can add now the gene names as colnames to our matrix. They are stored in:
+
+```{r}
+seurat_obj@assays$RNA@cells@.Data %>% rownames %>% head(20)
+```
+```{r}
+colnames(counts_seurat_dense) <- rownames(seurat_obj@assays$RNA@cells@.Data)
+counts_seurat_dense %>% colnames %>% head
+```
+
+```{r}
+counts_seurat_dense[1:5,1:5]
+```
+
+Now we will add all the information contained in `adata.obs` (cell_name, mouse, batch, strain, cell_type, cnv_leiden and cnv_score):
+
+```{r}
+adata$obs %>% head
+```
+
+Now we have a dataframe called `d` where wach row is a cell, and in the columns we have the metadata information (including CNV Leiden clusters from CNV inference by `invercnvpy`) plus gene expression.
+
+```{r}
+alldata <- counts_seurat_dense %>% as.data.frame
+obs <- adata$obs
+d <- cbind(obs, alldata)
+d %>% head
+```
+
+Work with our Seurat object 
+
+```{r}
+seurat_obj@meta.data <- seurat_obj@meta.data %>% 
+  mutate(cell_name = metadata$cell_name) %>%
+  mutate(cell_type = metadata$cell_type) %>%
+  mutate(strain = metadata$strain) %>%
+  mutate(mouse = metadata$mouse) %>%
+  mutate(cnv_cluster = metadata$cnv_leiden)
+```
+```{r}
+seurat_obj@meta.data %>% head
+```
+
+```{r}
+so2 <- readRDS("updatedProjected.rds")
+so2
+```
+```{r}
+seurat_obj %>% dim
+```
+
+```{r}
+so2@meta.data %>% head
+```
+
+```{r}
+so2@meta.data %>% dim
+```
+
+```{r}
+metadata %>% head
+```
+
+```{r}
+so2@meta.data <- so2@meta.data %>% 
+  mutate(cell_name = metadata$cell_name) %>%
+  mutate(cell_type = metadata$cell_type) %>%
+  mutate(strain = metadata$strain) %>%
+  mutate(mouse = metadata$mouse) %>%
+  mutate(cnv_cluster = metadata$cnv_leiden)
+  
+so2@meta.data %>% dim
+```
+
+```{r}
+so2@meta.data %>% head
+```
+
+```{r}
+so2@meta.data %>% colnames 
+```
+
+Process the Seurat object
+
+```{r}
+so_proc <- so2 %>%
+  NormalizeData(normalization.method = "LogNormalize", scale.factor = 10000) %>%
+  FindVariableFeatures( selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunHarmony(group.by.vars = "strain", dims.use = 1:30) %>%
+  RunUMAP(reduction = "harmony", dims = 1:30) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:30) %>% 
+  FindClusters(resolution = 0.6)
+```
+
+Plot UMAP
+
+```{r}
+custcols <- cust_cols <- c("#f6b26b", "#ff746f", "#8c5e78", "#f6a6b2", "#90d2d8", "#c79dd7", "#c2f2d0","#01aeb5","#A88C8C", "#D9BF77","#668D3C", "#EAD3BF", "#A77B65", "#ff80ed","#565656", "#5281A2","#12d4a2","#f8ff99")
+
+Idents(so_proc)<- so_proc@meta.data$cell_type
+Idents(so_proc) <- factor(Idents(so_proc), 
+                       levels = c("B.cell","T.cell","DC","pDC","Endothelial",
+                                  "Fibroblast","Macrophage","Neutrophil","Osteoclast",
+                                  "pericyte","Cancer.cell"))
+so_proc$cell_type <- factor(so_proc$cell_type, levels = c("B.cell","T.cell","DC","pDC","Endothelial",
+                                  "Fibroblast","Macrophage","Neutrophil","Osteoclast",
+                                  "pericyte","Cancer.cell"))
+DimPlot(so_proc, reduction = "umap", group.by = c("strain", "mouse", "cell_type", "cnv_cluster"), ncol = 2, cols = custcols) 
+```
+
+Plot a dotplot
+
+```{r}
+Idents(so_proc)<- so_proc@meta.data$cell_type
+Idents(so_proc) <- factor(Idents(so_proc), 
+                       levels = c("B.cell","T.cell","DC","pDC","Endothelial",
+                                  "Fibroblast","Macrophage","Neutrophil","Osteoclast",
+                                  "pericyte","Cancer.cell"))
+
+markers <- c("Cd79a","Ms4a1","Cd79b",
+             "Cd3e","Cd3g","Cd3d",
+             "Cd80","Itgae","Mmp12",
+             "Flt3","Cd8a","Cdh22",
+             "Cd34", "Cd36","Cdh13",
+             "Dpt","Mfap5","Pdgfra",
+             "Msr1","Mrc1", "Cd86",
+             "Nlrp3","G0s2","Cxcr2",
+             "Atp6v0d2","Acp5","Tnfrsf11a",
+             "Rgs5","Myh11","Des",
+             "Epcam","Krt8", "Krt18")
+
+DotPlot(so_proc, features = markers, cols = c("#fcfdbf", "#51127c"), 
+        dot.scale = 6) +
+        RotatedAxis() + 
+        theme(axis.text.y = element_text(size = 7, colour = "black")) +
+        theme(axis.text.x = element_text(size = 7, colour = "black")) +
+        theme(axis.title.y = element_text(size = 8, colour = "black")) +
+        theme(axis.title.x = element_text(size = 8, colour = "black")) +
+        theme(axis.ticks = element_blank()) +
+        theme(legend.title = element_text(size = 6),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 5),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+We can do a more elaborated dotplot
+
+```{r}
+scCustomize::Clustered_DotPlot(so_proc, features = markers, colors_use_idents = custcols,
+                               legend_label_size = 5, legend_title_size = 6, column_label_size = 5, x_lab_rotate = F, row_label_size = 5, cluster_feature = F, cluster_ident = F)
+```
+
+We can flip the plot
+
+```{r}
+scCustomize::Clustered_DotPlot(so_proc, features = markers, colors_use_idents = custcols,
+                              legend_label_size = 5, legend_title_size = 6, column_label_size = 5, row_label_size = 5, cluster_feature = F, cluster_ident = F, flip = T, seed = 123)
+```
+
+We can do a heatmap with the top markers (`top_markers`)
+
+```{r}
+
+top_markers_heatmap <- Extract_Top_Markers(marker_dataframe = all_markers, num_genes = 3, named_vector = FALSE,
+    make_unique = TRUE)
+
+DoHeatmap(subset(so_proc, downsample = 100), features = top_markers_heatmap, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+We can represent the cell markers in UMAPs
+
+```{r}
+FeaturePlot_scCustom(seurat_object = so_proc, features = c("Ms4a1","Cd3g","Itgae","Cdh22","Cdh13","Mfap5","Mrc1","Cxcr2","Atp6v0d2","Rgs5","Krt8"))
+```
+
+UMAPs with the top markers:
+
+```{r}
+FeaturePlot_scCustom(seurat_object = so_proc, features = c("Pax5","Trbc2","Htr7","Klk1","Cldn5","Bnc2","C1qa","G0s2","Cyp2s1","Higd1b","Gm49890"))
+```
+
+We can do UMAPs also representing cell types in individual mice
+
+```{r}
+so_proc$mouse <- factor(so_proc$mouse, levels = c("SITTA11","SITTC11","SITTD9","SITTE9","SITTF9","SITTA9","SITTB9","SITTB11","SITTC9","SITTH10"))
+```
+
+```{r}
+so_proc_umap <- DimPlot_scCustom(seurat_object = so_proc, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3, aspect_ratio = 1) + 
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=8))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_text(size = 6))+
+  theme(plot.title = element_text(hjust = 0.5, size = 5, face = "bold"))
+so_proc_umap
+```
+
+## Frequency of cell types
+
+```{r}
+so_proc_df <- as.data.frame(so_proc@meta.data)
+```
+
+```{r}
+so_proc_df_2 <- so_proc_df %>%
+  dplyr::group_by(strain, mouse, cell_type) %>%
+  dplyr::summarise(total_abund = n()) 
+
+so_proc_df_2 <- so_proc_df_2 %>%
+  dplyr::group_by(strain, mouse) %>%
+  dplyr::mutate(prop_abund = total_abund / sum(total_abund))
+```
+
+Frequency of cell types
+
+```{r}
+so_proc_df_2$cell_type <- factor(so_proc_df_2$cell_type, levels = c("B.cell","T.cell","DC","pDC","Endothelial",
+                                  "Fibroblast","Macrophage","Neutrophil","Osteoclast",
+                                  "pericyte","Cancer.cell"))
+
+so_proc_df_2_plot <- so_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cell_type))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Cell type frequency")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("Cell type frequency")+
+  guides(fill = guide_legend(title = "Cell type"))+
+  facet_wrap(vars(strain), ncol = 15, scales = "free")+
+  theme(strip.background = element_blank())+
+  theme(strip.text.x = element_text(size = 6, color = "black"))
+so_proc_df_2_plot
+```
+
+## Counts of cell types
+
+```{r}
+so_proc_df_2_plot_counts <- so_proc_df_2 %>%
+  ggplot(aes(x = factor(mouse), y = total_abund, fill = cell_type))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Cell type counts")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 8000), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 8000, by = 1000))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "Cell type"))+
+  facet_wrap(vars(strain), ncol = 15, scales = "free")+
+  theme(strip.background = element_blank())+
+  theme(strip.text.x = element_text(size = 6, color = "black"))
+so_proc_df_2_plot_counts
+```
+
+```{r}
+so_proc_df_2_plot_counts2 <- so_proc_df_2 %>%
+  ggplot(aes(x = factor(mouse), y = total_abund, fill = cell_type))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  # ggtitle("Cell type counts")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 8000), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 8000, by = 1000))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "Cell type"))+
+  facet_wrap(vars(strain), ncol = 15, scales = "free")+
+  theme(strip.background = element_blank())+
+  theme(strip.text.x = element_text(size = 8, face = "bold", color = "black"))
+  
+so_proc_df_2_plot2 <- so_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cell_type))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  # ggtitle("Cell type frequency")+
+  theme(plot.title = element_blank())+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_blank())+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("Cell type frequency")+
+  guides(fill = guide_legend(title = "Cell type"))+
+  facet_wrap(vars(strain), ncol = 15, scales = "free")+
+  theme(strip.background = element_blank())+
+  theme(strip.text.x = element_blank())
+
+ggarrange(so_proc_df_2_plot_counts2, so_proc_df_2_plot2, ncol = 1, nrow = 2, heights = c(0.5,0.5), align = "v", legend = "bottom", common.legend = T)
+```
+
+```{r}
+DimPlot_scCustom(seurat_object = so_proc, colors_use = cust_cols, split.by = "cnv_cluster", label = T, repel = T, split_seurat = T, label.size = 3, num_columns = 6)
+```
+
+# Cancer cells
+
+```{r}
+adata_cancer <- anndata::read_h5ad("adata_cancer_post_infercnv.h5ad")
+```
+
+Explore it. We get the same output that we see in Python.
+
+```{r}
+adata_cancer
+```
+
+Create Seurat object from `anndata` object metadata (in `obs`)
+
+```{r}
+
+metadata_cancer <- adata_cancer$obs %>% as.data.frame()
+seurat_obj_cancer <- CreateSeuratObject(counts = adata_cancer$X,
+                                  meta.data = metadata_cancer,
+                                  assay = "RNA",
+                                  min.cells = 3, min.features = 200)
+```
+
+Cell names are stored in `seurat_obj_cancer@assays$RNA@features@.Data %>% rownames`
+
+```{r}
+seurat_obj_cancer@assays$RNA@features@.Data %>% rownames %>% head
+
+```
+
+Our counts matrix is sparse and has 14217 genes (cols) x 19630 cells (rows)
+
+```{r}
+seurat_obj_cancer@assays$RNA@layers$counts  %>% dim %>% table
+```
+
+Maybe I can turn this matrix into a dense one and then add the cell names as rownames:
+
+```{r}
+counts_seurat_dense_cancer <- as.matrix(seurat_obj_cancer@assays$RNA@layers$counts)
+```
+
+```{r}
+counts_seurat_dense_cancer %>% dim %>% table
+```
+
+```{r}
+rownames(counts_seurat_dense_cancer) <- rownames(seurat_obj_cancer@assays$RNA@features@.Data)
+counts_seurat_dense_cancer %>% rownames %>% head
+```
+
+We can add now the gene names as colnames to our matrix. They are stored in:
+
+```{r}
+seurat_obj_cancer@assays$RNA@cells@.Data %>% rownames %>% head(20)
+```
+
+```{r}
+colnames(counts_seurat_dense_cancer) <- rownames(seurat_obj_cancer@assays$RNA@cells@.Data)
+counts_seurat_dense_cancer %>% colnames %>% head
+```
+
+```{r}
+counts_seurat_dense_cancer[1:5,1:5]
+```
+
+Now we will add all the information contained in `adata.obs` (cell_name, mouse, batch, strain, cell_type, cnv_leiden and cnv_score):
+
+```{r}
+adata_cancer$obs %>% head
+```
+
+```{r}
+alldata_cancer <- counts_seurat_dense_cancer %>% as.data.frame
+obs_cancer <- adata_cancer$obs
+d_cancer <- cbind(obs_cancer, alldata_cancer)
+d_cancer %>% head
+```
+
+```{r}
+d_cancer$cnv_leiden %>% table
+```
+
+Subset cancer cells from Seurat object 
+
+```{r}
+so_orig <- readRDS("/updatedProjected.rds")
+so_cancer <- subset(so_orig, idents = "Cancer.cell")
+so_cancer@meta.data %>% colnames
+```
+```{r}
+so_cancer@meta.data %>% dim
+```
+
+```{r}
+metadata_cancer %>% dim
+```
+
+Add metadata
+
+```{r}
+so_cancer@meta.data <- so_cancer@meta.data %>% 
+  mutate(cell_name = metadata_cancer$cell_name) %>%
+  mutate(strain = metadata_cancer$strain) %>%
+  mutate(mouse = metadata_cancer$mouse) %>%
+  mutate(cnv_cluster = metadata_cancer$cnv_leiden)
+  
+so_cancer@meta.data %>% dim
+```
+
+Process data
+
+```{r}
+so_cancer_proc <- so_cancer %>%
+  NormalizeData(normalization.method = "LogNormalize", scale.factor = 10000) %>%
+  FindVariableFeatures( selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunHarmony(group.by.vars = "strain", dims.use = 1:30) %>%
+  RunUMAP(reduction = "harmony", dims = 1:30) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:30) %>% 
+  FindClusters(resolution = 0.6)
+```
+
+Plot top markers in cnv clusters of cancer cells
+
+```{r}
+Idents(so_cancer_proc)<- so_cancer_proc@meta.data$cnv_cluster
+Idents(so_cancer_proc) <- factor(Idents(so_cancer_proc), 
+                       levels = c("0", "1", "2", "3", "4", "5", "6", 
+                                  "7", "8", "9", "10", "11", "12", "13"))
+
+all_markers_cancer <- FindAllMarkers(object = so_cancer_proc) %>%
+    Add_Pct_Diff() %>%
+    filter(pct_diff > 0.6)
+
+
+top_markers_cancer <- Extract_Top_Markers(marker_dataframe = all_markers_cancer, num_genes = 50, named_vector = FALSE, make_unique = TRUE)
+
+Clustered_DotPlot(seurat_object = so_cancer_proc, features = top_markers_cancer, colors_use_idents = custcols, legend_label_size = 5, legend_title_size = 6, column_label_size = 5, row_label_size = 5, cluster_feature = F, cluster_ident = F, flip = T, seed = 123)
+```
+
+```{r}
+DimPlot(so_cancer_proc, reduction = "umap", group.by = c("strain", "mouse", "cnv_cluster"), ncol = 2, cols = cust_cols)
+```
+
+```{r}
+so_cancer_proc$states <- factor(so_cancer_proc$states, levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+DimPlot(so_cancer_proc, reduction = "umap", group.by = c("strain", "mouse", "cnv_cluster","states"), ncol = 2, cols = cust_cols)
+```
+
+Cluster by CNV clusters across individual mice:
+
+```{r}
+so_cancer_proc$mouse <- factor(so_cancer_proc$mouse, levels = c("SITTA11","SITTC11","SITTD9","SITTE9","SITTF9","SITTA9","SITTB9","SITTB11","SITTC9","SITTH10"))
+
+DimPlot_scCustom(seurat_object = so_cancer_proc, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3)
+```
+
+Cluster by CNV clusters between strains:
+
+```{r}
+so_cancer_proc_2 <- so_cancer_proc
+Idents(so_cancer_proc_2)<- so_cancer_proc_2@meta.data$cnv_cluster
+Idents(so_cancer_proc_2) <- factor(Idents(so_cancer_proc_2), 
+                       levels = c("0","1","2","3","4","5","6","7",
+                                  "8","9","10","11","12","13"))
+
+DimPlot_scCustom(seurat_object = so_cancer_proc_2, colors_use = cust_cols, split.by = "strain", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3)
+```
+
+Cluster by cell states between strains:
+
+```{r}
+so_cancer_proc_3 <- so_cancer_proc
+Idents(so_cancer_proc_3)<- so_cancer_proc_3@meta.data$states
+Idents(so_cancer_proc_3) <- factor(Idents(so_cancer_proc_3), 
+                       levels = c("Csf3.cancer","Epcam.cancer","Pecam1.cancer","Ndrg1.cancer","Interferon.cancer",
+"Macro-like.cancer","Macro-like.Cancer","proliferative.cancer","Translation.cancer",
+"Cancer.cell.1","Cancer.cell.2","Cancer.cell3", "Cancer.cell.4"))
+
+DimPlot_scCustom(seurat_object = so_cancer_proc_3, colors_use = cust_cols, split.by = "strain", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3)
+```
+
+We can split by mouse instead of strain:
+
+```{r}
+DimPlot_scCustom(seurat_object = so_cancer_proc_3, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3)
+```
+
+## Clones per sample
+
+```{r}
+so_cancer_proc %>% head
+```
+
+```{r}
+so_cancer_proc_df <- as.data.frame(so_cancer_proc@meta.data)
+```
+
+```{r}
+so_cancer_proc_df_2 <- so_cancer_proc_df %>%
+  dplyr::group_by(mouse, strain, cnv_cluster) %>%
+  dplyr::summarise(total_abund = n()) 
+
+so_cancer_proc_df_2 <- so_cancer_proc_df_2 %>%
+  dplyr::group_by(mouse, strain) %>%
+  dplyr::mutate(prop_abund = total_abund / sum(total_abund))
+```
+
+```{r}
+so_cancer_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Frequency of CNV Clusters in cancer cells from scRNAseq data")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("CNV Cluster frequency")+
+  guides(fill = guide_legend(title = "CNV Cluster"))+
+  facet_wrap(vars(strain), ncol = 15, scales = "free")+
+  theme(strip.background = element_blank())+
+  theme(strip.text.x = element_text(size = 6, color = "black"))
+  
+```
+
+## Single Cell Pathway Analysis
+
+We will download Hallmark pathways from MolsigDB - category MH: orthology-mapped hallmark gene sets
+
+```{r}
+library(SCPA)
+library(msigdbr)
+pathways <- msigdbr(species = "Mus musculus", category = "H") %>%
+      format_pathways()
+pathways %>% head
+```
+
+Now we will run the comparison
+
+```{r}
+scpa_out_ <- compare_seurat(so_cancer_proc,
+                           group1 = "strain", 
+                           group1_population = c("balb", "nsg"),
+                           pathways = pathways)
+scpa_out_ %>% head(10)
+```
+
+```{r}
+plot_rank(scpa_out_, c("HALLMARK_INTERFERON_GAMMA_RESPONSE","HALLMARK_INTERFERON_ALPHA_RESPONSE","HALLMARK_COMPLEMENT","HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION","HALLMARK_KRAS_SIGNALING_UP","HALLMARK_P53_PATHWAY", "HALLMARK_TNFA_SIGNALING_VIA_NFKB","HALLMARK_IL2_STAT5_SIGNALING","HALLMARK_INFLAMMATORY_RESPONSE","HALLMARK_MTORC1_SIGNALING","HALLMARK_IL6_JAK_STAT3_SIGNALING","HALLMARK_UNFOLDED_PROTEIN_RESPONSE","HALLMARK_TGF_BETA_SIGNALING","HALLMARK_PI3K_AKT_MTOR_SIGNALING","HALLMARK_NOTCH_SIGNALING","HALLMARK_WNT_BETA_CATENIN_SIGNALING"), 
+                highlight_point_size = 3, highlight_point_color = "#60c5f7", label_size = 3)
+```
+
+Save csv file
+
+```{r}
+write.csv(scpa_out_, "SCPA_output.csv", row.names = FALSE, col.names = TRUE)
+```
+
+We can plot a heatmap
+
+```{r}
+plot_heatmap(scpa_out_, 
+             highlight_pathways = c("HALLMARK_INTERFERON_GAMMA_RESPONSE","HALLMARK_INTERFERON_ALPHA_RESPONSE","HALLMARK_COMPLEMENT","HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION","HALLMARK_KRAS_SIGNALING_UP","HALLMARK_P53_PATHWAY", "HALLMARK_TNFA_SIGNALING_VIA_NFKB","HALLMARK_IL2_STAT5_SIGNALING","HALLMARK_INFLAMMATORY_RESPONSE","HALLMARK_MTORC1_SIGNALING","HALLMARK_IL6_JAK_STAT3_SIGNALING","HALLMARK_UNFOLDED_PROTEIN_RESPONSE","HALLMARK_TGF_BETA_SIGNALING","HALLMARK_PI3K_AKT_MTOR_SIGNALING","HALLMARK_NOTCH_SIGNALING","HALLMARK_WNT_BETA_CATENIN_SIGNALING"),
+             show_row_names = F)
+```
+
+# MERFISH genes in CNV clusters
+
+We will study the MERFISH genes in the CNV clusters in the `so_cancer_proc` object. Ideally we should study separately Balb/C and NSG samples.
+
+```{r}
+merfish_genes <- read.csv("genes_mouse_merfish_balb.tsv", sep = "\t", header = F)
+merfish_genes %>% head
+```
+
+```{r}
+merfish_genes_list <- merfish_genes[,1]
+merfish_genes_list %>% head
+```
+
+```{r}
+merfish_genes_list %>% length()
+```
+
+Do the plots. Start by heatmap
+
+```{r}
+DoHeatmap(subset(so_cancer_proc, downsample = 100), features = merfish_genes_list, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+This is to order heatmap genes 
+
+```{r}
+merfish_genes_toplot <- FindAllMarkers(object = so_cancer_proc, features = merfish_genes_list)
+top20 <- merfish_genes_toplot %>% group_by(cluster) %>% top_n(20, avg_log2FC)
+top10 <- merfish_genes_toplot %>% group_by(cluster) %>% top_n(10, avg_log2FC)
+
+```
+
+Save csv file of 10 top MERFISH genes per CNV cluster 
+
+```{r}
+write.csv(top10, "top10_genes_merfish_cnv.csv", row.names = F)
+```
+
+```{r}
+DoHeatmap(subset(so_cancer_proc, downsample = 100), features = top10$gene, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+# Cancer cells per strain
+
+Load the `anndata` objects for Balb/C mice and NSG mice.
+
+```{r}
+adata_cancer_balb <- anndata::read_h5ad("adata_cancer_balb_post_infercnv.h5ad")
+adata_cancer_nsg <- anndata::read_h5ad("adata_cancer_nsg_post_infercnv.h5ad")
+```
+
+Here is Balb/C
+
+```{r}
+adata_cancer_balb
+```
+
+Here is NSG
+
+```{r}
+adata_cancer_nsg
+```
+
+Create the Seurat objects
+
+```{r}
+metadata_cancer_balb <- adata_cancer_balb$obs %>% as.data.frame()
+seurat_obj_cancer_balb <- CreateSeuratObject(counts = adata_cancer_balb$X,
+                                  meta.data = metadata_cancer_balb,
+                                  assay = "RNA",
+                                  min.cells = 3, min.features = 200)
+
+metadata_cancer_nsg <- adata_cancer_nsg$obs %>% as.data.frame()
+seurat_obj_cancer_nsg <- CreateSeuratObject(counts = adata_cancer_nsg$X,
+                                  meta.data = metadata_cancer_nsg,
+                                  assay = "RNA",
+                                  min.cells = 3, min.features = 200)
+```
+
+Cell names are stored in `seurat_obj_cancer_balb@assays$RNA@features@.Data %>% rownames`
+
+```{r}
+seurat_obj_cancer_balb@assays$RNA@features@.Data %>% rownames %>% head
+
+```
+
+Our counts matrix for Balb/C mice is sparse and has 8699 genes (cols) x 12498 cells (rows)
+
+```{r}
+seurat_obj_cancer_balb@assays$RNA@layers$counts  %>% dim %>% table
+```
+
+Our counts matrix for NSG mice is sparse and has 10931 genes (cols) x 12967 cells (rows)
+
+```{r}
+seurat_obj_cancer_nsg@assays$RNA@layers$counts  %>% dim %>% table
+```
+
+Now we transform our matrices to dense ones:
+
+```{r}
+counts_seurat_dense_cancer_balb <- as.matrix(seurat_obj_cancer_balb@assays$RNA@layers$counts)
+counts_seurat_dense_cancer_nsg <- as.matrix(seurat_obj_cancer_nsg@assays$RNA@layers$counts)
+```
+
+```{r}
+rownames(counts_seurat_dense_cancer_balb) <- rownames(seurat_obj_cancer_balb@assays$RNA@features@.Data)
+counts_seurat_dense_cancer_balb %>% rownames %>% head
+```
+
+```{r}
+rownames(counts_seurat_dense_cancer_nsg) <- rownames(seurat_obj_cancer_nsg@assays$RNA@features@.Data)
+counts_seurat_dense_cancer_nsg %>% rownames %>% head
+```
+
+We can add now the gene names as colnames to our matrix. They are stored in:
+
+```{r}
+seurat_obj_cancer_balb@assays$RNA@cells@.Data %>% rownames %>% head(20)
+```
+
+```{r}
+seurat_obj_cancer_nsg@assays$RNA@cells@.Data %>% rownames %>% head(20)
+```
+
+```{r}
+colnames(counts_seurat_dense_cancer_balb) <- rownames(seurat_obj_cancer_balb@assays$RNA@cells@.Data)
+counts_seurat_dense_cancer_balb %>% colnames %>% head
+```
+
+```{r}
+colnames(counts_seurat_dense_cancer_nsg) <- rownames(seurat_obj_cancer_nsg@assays$RNA@cells@.Data)
+counts_seurat_dense_cancer_nsg %>% colnames %>% head
+```
+
+```{r}
+counts_seurat_dense_cancer_balb[1:5,1:5]
+```
+
+```{r}
+counts_seurat_dense_cancer_nsg[1:5,1:5]
+```
+
+Now we will add all the information contained in `adata.obs` (cell_name, mouse, batch, strain, cell_type, cnv_leiden and cnv_score):
+
+```{r}
+adata_cancer_balb$obs %>% head
+```
+
+```{r}
+adata_cancer_nsg$obs %>% head
+```
+
+```{r}
+alldata_cancer_balb <- counts_seurat_dense_cancer_balb %>% as.data.frame
+obs_cancer_balb <- adata_cancer_balb$obs
+d_cancer_balb <- cbind(obs_cancer_balb, alldata_cancer_balb)
+d_cancer_balb %>% head
+```
+
+```{r}
+alldata_cancer_nsg <- counts_seurat_dense_cancer_nsg %>% as.data.frame
+obs_cancer_nsg <- adata_cancer_nsg$obs
+d_cancer_nsg <- cbind(obs_cancer_nsg, alldata_cancer_nsg)
+d_cancer_nsg %>% head
+```
+
+## Balb/C cancer cells
+
+Subset cancer cells & strain from `so2` object
+
+```{r}
+so_orig_balb <- readRDS("updatedProjected.rds")
+so_cancer_balb <- subset(so_orig_balb, idents = "Cancer.cell")
+```
+
+```{r}
+so_cancer_balb2 <- so_cancer_balb
+Idents(so_cancer_balb2)<- so_cancer_balb2@meta.data$exp
+Idents(so_cancer_balb2) <- factor(Idents(so_cancer_balb2), 
+                       levels = c("balb","nsg"))
+```
+
+```{r}
+so_cancer_balb_subset <- subset(so_cancer_balb2, idents = "balb")
+so_cancer_balb_subset@meta.data %>% colnames
+```
+
+```{r}
+so_cancer_balb_subset$exp %>% unique
+```
+
+This is our seurat object for Balb/C mice, with 24516 genes as rownames and 8699 cells as columns
+
+```{r}
+so_cancer_balb_subset %>% dim
+```
+
+```{r}
+so_cancer_balb_subset %>% colnames %>% head
+```
+
+```{r}
+so_cancer_balb_subset %>% rownames %>% head
+```
+
+And this is the anndata object for Balb/C mice that contains 8699 columns that include some information + all genes studied. Each row is a cell:
+
+```{r}
+d_cancer_balb %>% dim
+```
+
+```{r}
+d_cancer_balb %>% colnames %>% head(10)
+```
+
+```{r}
+d_cancer_balb %>% rownames %>% head
+```
+
+Add the information to the `Seurat` object:
+
+```{r}
+so_cancer_balb_subset@meta.data <- so_cancer_balb_subset@meta.data %>% 
+  mutate(cell_name = d_cancer_balb$cell_name) %>%
+  mutate(strain = d_cancer_balb$strain) %>%
+  mutate(mouse = d_cancer_balb$mouse) %>%
+  mutate(cnv_cluster = d_cancer_balb$cnv_leiden)
+  
+so_cancer_balb_subset@meta.data %>% dim
+```
+
+Now we have to process it:
+
+```{r}
+library(harmony)
+so_cancer_balb_subset_proc <- so_cancer_balb_subset %>%
+  NormalizeData(normalization.method = "LogNormalize", scale.factor = 10000) %>%
+  FindVariableFeatures( selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunHarmony(group.by.vars = "mouse", dims.use = 1:30) %>%
+  RunUMAP(reduction = "harmony", dims = 1:30) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:30) %>% 
+  FindClusters(resolution = 0.6)
+```
+
+So `so_cancer_balb_subset_proc` is the final processed Seurat object for Balb/C mice cancer cells.
+
+We can plot top markers of each cluster
+
+```{r}
+library(scCustomize)
+markers_cancer_balb <- FindAllMarkers(object = so_cancer_balb_subset_proc)
+top_markers_heatmap_cancer_balb <- Extract_Top_Markers(marker_dataframe = markers_cancer_balb, num_genes = 10, named_vector = FALSE,
+    make_unique = TRUE)
+```
+
+```{r}
+DoHeatmap(so_cancer_balb_subset_proc, features = top_markers_heatmap_cancer_balb, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+Save csv file with top markers
+
+```{r}
+balb_filtered_markers <- markers_cancer_balb %>%
+  filter(gene %in% top_markers_heatmap_cancer_balb) %>%
+  arrange(cluster, p_val_adj)
+balb_filtered_markers %>% head
+```
+
+```{r}
+write.csv(balb_filtered_markers, "top_markers_balb.csv", row.names = F)
+```
+
+Same for MERFISH studied genes
+
+```{r}
+balb_filtered_markers_merfish <- markers_cancer_balb %>%
+  filter(gene %in% top10$gene) %>%
+  arrange(cluster, p_val_adj)
+balb_filtered_markers_merfish %>% head
+```
+
+```{r}
+write.csv(balb_filtered_markers_merfish, "top_markers_balb_merfish.csv", row.names = F)
+
+```
+
+If we study only MERFISH genes:
+
+```{r}
+DoHeatmap(so_cancer_balb_subset_proc, features = top10$gene, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+## NSG cancer cells
+
+We can subset nsg cells instead of balb (proceeding analogously as before)
+
+```{r}
+so_cancer_nsg_subset <- subset(so_cancer_balb2, idents = "nsg")
+so_cancer_nsg_subset$exp %>% unique
+```
+
+This is the anndata object for NSG mice that contains 8699 columns that include some information + all genes studied. Each row is a cell:
+
+```{r}
+d_cancer_balb %>% dim
+```
+
+Add the information to the `Seurat` object:
+
+```{r}
+so_cancer_nsg_subset@meta.data <- so_cancer_nsg_subset@meta.data %>% 
+  mutate(cell_name = d_cancer_nsg$cell_name) %>%
+  mutate(strain = d_cancer_nsg$strain) %>%
+  mutate(mouse = d_cancer_nsg$mouse) %>%
+  mutate(cnv_cluster = d_cancer_nsg$cnv_leiden)
+  
+so_cancer_nsg_subset@meta.data %>% dim
+```
+
+Now we have to process it:
+
+```{r}
+so_cancer_nsg_subset_proc <- so_cancer_nsg_subset %>%
+  NormalizeData(normalization.method = "LogNormalize", scale.factor = 10000) %>%
+  FindVariableFeatures( selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData() %>%
+  RunPCA() %>%
+  RunHarmony(group.by.vars = "mouse", dims.use = 1:30) %>%
+  RunUMAP(reduction = "harmony", dims = 1:30) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:30) %>% 
+  FindClusters(resolution = 0.6)
+```
+
+So `so_cancer_nsg_subset_proc` is the final processed Seurat object for NSG mice cancer cells.
+
+We can plot top markers of each cluster
+
+```{r}
+markers_cancer_nsg <- FindAllMarkers(object = so_cancer_nsg_subset_proc)
+top_markers_heatmap_cancer_nsg <- Extract_Top_Markers(marker_dataframe = markers_cancer_nsg, num_genes = 10, named_vector = FALSE,
+    make_unique = TRUE)
+
+DoHeatmap(so_cancer_nsg_subset_proc, features = top_markers_heatmap_cancer_nsg, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+Save csv file with top markers
+
+```{r}
+nsg_filtered_markers <- markers_cancer_nsg %>%
+  filter(gene %in% top_markers_heatmap_cancer_nsg) %>%
+  arrange(cluster, p_val_adj)
+nsg_filtered_markers %>% head
+```
+
+```{r}
+write.csv(nsg_filtered_markers, "top_markers_nsg.csv", row.names = F)
+```
+
+Same for MERFISH studied genes
+
+```{r}
+nsg_filtered_markers_merfish <- markers_cancer_nsg %>%
+  filter(gene %in% top10$gene) %>%
+  arrange(cluster, p_val_adj)
+nsg_filtered_markers_merfish %>% head
+```
+
+```{r}
+write.csv(nsg_filtered_markers_merfish, "top_markers_nsg_merfish.csv", row.names = F)
+```
+
+Plot only MERFISH genes
+
+```{r}
+DoHeatmap(so_cancer_nsg_subset_proc, features = top10$gene, size = 2.5, angle = 0, hjust = 0.5, group.colors = custcols) + 
+  theme(axis.text.y = element_text(size = 6, colour = "black")) +
+  scale_fill_viridis_c(option = "magma") +
+  theme(legend.title = element_text(size = 7),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = 6),
+          legend.key.size = unit(0.2, 'cm'),
+          legend.key.height = unit(0.2, 'cm'),
+          legend.key.width = unit(0.2, 'cm'))
+```
+
+We can find which markers are common between `top_markers_heatmap_cancer_nsg` and `top_markers_heatmap_cancer_balb`:
+
+```{r}
+intersect(top_markers_heatmap_cancer_nsg, top_markers_heatmap_cancer_balb)
+```
+
+These are the unique markers for NSG mice:
+
+```{r}
+setdiff(top_markers_heatmap_cancer_nsg, intersect(top_markers_heatmap_cancer_nsg, top_markers_heatmap_cancer_balb))
+```
+
+These are the unique markers for Balb/C mice:
+
+```{r}
+setdiff(top_markers_heatmap_cancer_balb, intersect(top_markers_heatmap_cancer_balb, top_markers_heatmap_cancer_nsg))
+```
+
+Cells per cluster:
+
+```{r}
+so_cancer_balb_subset_proc@meta.data$cnv_cluster %>% table
+```
+
+```{r}
+so_cancer_nsg_subset_proc@meta.data$cnv_cluster %>% table
+```
+
+## Frequency of CNV clusters in Balb and NSG separately
+
+```{r}
+so_cancer_balb_proc_df <- as.data.frame(so_cancer_balb_subset_proc@meta.data)
+```
+
+```{r}
+so_cancer_nsg_proc_df <- as.data.frame(so_cancer_nsg_subset_proc@meta.data)
+```
+
+```{r}
+so_cancer_balb_proc_df_2 <- so_cancer_balb_proc_df %>%
+  dplyr::group_by(mouse, cnv_cluster) %>%
+  dplyr::summarise(total_abund = n()) 
+
+so_cancer_balb_proc_df_2 <- so_cancer_balb_proc_df_2 %>%
+  dplyr::group_by(mouse) %>%
+  dplyr::mutate(prop_abund = total_abund / sum(total_abund))
+```
+
+```{r}
+so_cancer_nsg_proc_df_2 <- so_cancer_nsg_proc_df %>%
+  dplyr::group_by(mouse, cnv_cluster) %>%
+  dplyr::summarise(total_abund = n()) 
+
+so_cancer_nsg_proc_df_2 <- so_cancer_nsg_proc_df_2 %>%
+  dplyr::group_by(mouse) %>%
+  dplyr::mutate(prop_abund = total_abund / sum(total_abund))
+```
+
+Frequency of CNV Clusters:
+
+```{r}
+balb_plot_freq <- so_cancer_balb_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Balb/C")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("CNV Cluster frequency")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+  
+nsg_plot_freq <- so_cancer_nsg_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("CNV Cluster frequency")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+
+ggarrange(balb_plot_freq, nsg_plot_freq, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "bottom", common.legend = T)
+```
+
+Total counts:
+
+```{r}
+balb_plot_counts <- so_cancer_balb_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = total_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Balb/C")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+  
+nsg_plot_counts <- so_cancer_nsg_proc_df_2 %>%
+  ggplot(aes(x = factor(mouse), y = total_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.8)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+
+ggarrange(balb_plot_counts, nsg_plot_counts, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "bottom", common.legend = T)
+```
+
+UMAP by CNV cluster and strains separatedly
+
+```{r}
+so_cancer_balb_subset_proc$mouse <- factor(so_cancer_balb_subset_proc$mouse, levels = c("SITTA11","SITTC11","SITTD9","SITTE9","SITTF9"))
+
+so_cancer_nsg_subset_proc$mouse <- factor(so_cancer_nsg_subset_proc$mouse, levels = c("SITTA9","SITTB9","SITTB11","SITTC9","SITTH10"))
+```
+
+```{r}
+balb_umap <- DimPlot_scCustom(seurat_object = so_cancer_balb_subset_proc, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3, aspect_ratio = 1) + 
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=8))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_text(size = 6))+
+  theme(plot.title = element_text(hjust = 0.5, size = 5, face = "bold"))
+
+nsg_umap <- DimPlot_scCustom(seurat_object = so_cancer_nsg_subset_proc, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 3, aspect_ratio = 1) + 
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=8))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_text(size = 6))+
+  theme(plot.title = element_text(hjust = 0.5, size = 5, face = "bold"))
+
+ggarrange(balb_umap, nsg_umap, ncol = 1, nrow = 2, heights = c(0.5,0.5), align = "v", legend = "right", common.legend = T)
+```
+
+```{r}
+balb_plot_counts2 <- so_cancer_balb_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = total_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  # ggtitle("Balb/C")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+  
+nsg_plot_counts2 <- so_cancer_nsg_proc_df_2 %>%
+  ggplot(aes(x = factor(mouse), y = total_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.8)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  # ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+
+balb_plot_freq2 <- so_cancer_balb_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("CNV Cluster frequency")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+  
+nsg_plot_freq2 <- so_cancer_nsg_proc_df_2 %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = cnv_cluster))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("CNV Cluster frequency")+
+  guides(fill = guide_legend(title = "CNV Cluster"))
+
+ggarrange(balb_plot_counts2, nsg_plot_counts2, balb_plot_freq2, nsg_plot_freq2, ncol = 2, nrow = 2, heights = c(0.5,0.5), align = "v", legend = "bottom", common.legend = T)
+```
+
+## Entropy per sample
+
+```{r}
+df_balb_shannon <- so_cancer_balb_proc_df_2 %>%
+  dplyr::mutate(shannon_entropy = -prop_abund * log2(prop_abund + 1e-10)) %>%
+  dplyr::group_by(mouse, cnv_cluster) %>% 
+  dplyr::mutate(shannon_entropy = sum(shannon_entropy)) %>%
+  dplyr::ungroup()
+df_balb_shannon %>% head
+```
+
+```{r}
+entropy_balb <- df_balb_shannon %>%
+  ggplot(aes(x = mouse, y = shannon_entropy, fill = mouse, color = mouse))+
+  geom_violin(alpha = 0.3)+
+  geom_boxplot(width = 0.2, fill = "white", alpha = 0.7)+
+  geom_jitter(alpha = 0.8)+
+  scale_fill_manual(values = cust_cols[1:5])+
+  scale_color_manual(values = cust_cols[1:5])+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.line.x = element_blank())+
+  theme(axis.text.x = element_blank())+  
+  theme(legend.position="none")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  coord_cartesian(expand = F, ylim = c(0, 0.6), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 0.6, by = 0.15))+
+  ggtitle("Balb/C")+
+  xlab("Mouse")+
+  ylab("Shannon Entropy")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+df_nsg_shannon <- so_cancer_nsg_proc_df_2 %>%
+  dplyr::mutate(shannon_entropy = -prop_abund * log2(prop_abund + 1e-10)) %>%
+  dplyr::group_by(mouse, cnv_cluster) %>% 
+  dplyr::mutate(shannon_entropy = sum(shannon_entropy)) %>%
+  dplyr::ungroup()
+df_nsg_shannon %>% head
+```
+
+```{r}
+entropy_nsg <- df_nsg_shannon %>%
+  ggplot(aes(x = mouse, y = shannon_entropy, fill = mouse, color = mouse))+
+  geom_violin(alpha = 0.3)+
+  geom_boxplot(width = 0.2, fill = "white", alpha = 0.7)+
+  geom_jitter(alpha = 0.8)+
+  scale_fill_manual(values = cust_cols[6:10])+
+  scale_color_manual(values = cust_cols[6:10])+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.line.x = element_blank())+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="none")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  coord_cartesian(expand = F, ylim = c(0, 0.60), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 0.60, by = 0.15))+
+  xlab("Mouse")+
+  ylab("Shannon Entropy")+
+  ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+ggarrange(entropy_balb, entropy_nsg, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "none")
+```
+
+```{r}
+counts_plots <- ggarrange(balb_plot_counts2, nsg_plot_counts2, balb_plot_freq2, nsg_plot_freq2, ncol = 2, nrow = 2, heights = c(0.5,0.5), align = "v", legend = "bottom", common.legend = T)
+entropies <- ggarrange(entropy_balb, entropy_nsg, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "none")
+ggarrange(entropies, counts_plots, align = "hv", ncol = 1, nrow = 2, heights = c(0.3, 0.6), widths = c(0.3, 0.3))
+```
+
+## Frequency of cell states
+
+```{r}
+
+so_cancer_balb_proc_df_states <- so_cancer_balb_proc_df %>%
+  dplyr::group_by(mouse, states) %>%
+  dplyr::summarise(total_abund = n()) 
+
+so_cancer_balb_proc_df_states <- so_cancer_balb_proc_df_states %>%
+  dplyr::group_by(mouse) %>%
+  dplyr::mutate(prop_abund = total_abund / sum(total_abund))
+```
+
+```{r}
+so_cancer_nsg_proc_df_states <- so_cancer_nsg_proc_df %>%
+  dplyr::group_by(mouse, states) %>%
+  dplyr::summarise(total_abund = n()) 
+
+so_cancer_nsg_proc_df_states <- so_cancer_nsg_proc_df_states %>%
+  dplyr::group_by(mouse) %>%
+  dplyr::mutate(prop_abund = total_abund / sum(total_abund))
+```
+
+Frequency of cell states:
+
+```{r}
+so_cancer_balb_proc_df_states$states <- factor(so_cancer_balb_proc_df_states$states, levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+
+so_cancer_nsg_proc_df_states$states <- factor(so_cancer_nsg_proc_df_states$states, levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+
+balb_plot_states <- so_cancer_balb_proc_df_states %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Balb/C")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("Cell states frequency")+
+  guides(fill = guide_legend(title = "State"))
+  
+nsg_plot_states <- so_cancer_nsg_proc_df_states %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("Cell states frequency")+
+  guides(fill = guide_legend(title = "State"))
+
+ggarrange(balb_plot_states, nsg_plot_states, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "bottom", common.legend = T)
+```
+
+Total counts of cell states
+
+Total counts:
+
+```{r}
+so_cancer_balb_proc_df_states$states <- factor(so_cancer_balb_proc_df_states$states, levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+
+so_cancer_nsg_proc_df_states$states <- factor(so_cancer_nsg_proc_df_states$states, levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+
+balb_plot_counts_states <- so_cancer_balb_proc_df_states %>%
+  ggplot(aes(x = mouse, y = total_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("Balb/C")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "State"))
+  
+nsg_plot_counts_states <- so_cancer_nsg_proc_df_states %>%
+  ggplot(aes(x = factor(mouse), y = total_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.8)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "State"))
+
+ggarrange(balb_plot_counts_states, nsg_plot_counts_states, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "bottom", common.legend = T)
+```
+
+UMAP by cell states
+
+```{r}
+so_cancer_balb_subset_proc_states <- so_cancer_balb_subset_proc
+Idents(so_cancer_balb_subset_proc_states)<- so_cancer_balb_subset_proc_states@meta.data$states
+Idents(so_cancer_balb_subset_proc_states) <- factor(Idents(so_cancer_balb_subset_proc_states), 
+                       levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+```
+
+```{r}
+so_cancer_nsg_subset_proc_states <- so_cancer_nsg_subset_proc
+Idents(so_cancer_nsg_subset_proc_states)<- so_cancer_nsg_subset_proc_states@meta.data$states
+Idents(so_cancer_nsg_subset_proc_states) <- factor(Idents(so_cancer_nsg_subset_proc_states), 
+                       levels = c("Cancer.cell.1", "Cancer.cell.2", "Cancer.cell3", "Cancer.cell.4", "Csf3.cancer", "Epcam.cancer", "Interferon.cancer",  "Macro-like.Cancer", "Macro-like.cancer", "Ndrg1.cancer", "Pecam1.cancer", "proliferative.cancer", "Translation.cancer"))
+```
+
+
+```{r}
+balb_umap_states <- DimPlot_scCustom(seurat_object = so_cancer_balb_subset_proc_states, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 1.5, aspect_ratio = 1) + 
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=8))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_text(size = 6))+
+  theme(plot.title = element_text(hjust = 0.5, size = 5, face = "bold"))
+
+nsg_umap_states <- DimPlot_scCustom(seurat_object = so_cancer_nsg_subset_proc_states, colors_use = cust_cols, split.by = "mouse", label = T, repel = T, split_seurat = T, num_columns = 5, label.size = 1.5, aspect_ratio = 1) + 
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=8))+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_text(size = 6))+
+  theme(plot.title = element_text(hjust = 0.5, size = 5, face = "bold"))
+
+ggarrange(balb_umap_states, nsg_umap_states, ncol = 1, nrow = 2, heights = c(0.5,0.5), align = "v", legend = "right", common.legend = T)
+```
+
+## Entropy per sample - cell states
+
+```{r}
+df_balb_shannon_states <- so_cancer_balb_proc_df_states %>%
+  dplyr::mutate(shannon_entropy = -prop_abund * log2(prop_abund + 1e-10)) %>%
+  dplyr::group_by(mouse, states) %>% 
+  dplyr::mutate(shannon_entropy = sum(shannon_entropy)) %>%
+  dplyr::ungroup()
+df_balb_shannon_states %>% head
+```
+
+```{r}
+entropy_balb_states <- df_balb_shannon_states %>%
+  ggplot(aes(x = mouse, y = shannon_entropy, fill = mouse, color = mouse))+
+  geom_violin(alpha = 0.3)+
+  geom_boxplot(width = 0.2, fill = "white", alpha = 0.7)+
+  geom_jitter(alpha = 0.8)+
+  scale_fill_manual(values = cust_cols[1:5])+
+  scale_color_manual(values = cust_cols[1:5])+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.line.x = element_blank())+
+  theme(axis.text.x = element_blank())+  
+  theme(legend.position="none")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  coord_cartesian(expand = F, ylim = c(0, 0.6), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 0.6, by = 0.15))+
+  ggtitle("Balb/C")+
+  xlab("Mouse")+
+  ylab("Shannon Entropy")+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+df_nsg_shannon_states <- so_cancer_nsg_proc_df_states %>%
+  dplyr::mutate(shannon_entropy = -prop_abund * log2(prop_abund + 1e-10)) %>%
+  dplyr::group_by(mouse, states) %>% 
+  dplyr::mutate(shannon_entropy = sum(shannon_entropy)) %>%
+  dplyr::ungroup()
+df_nsg_shannon_states %>% head
+```
+
+```{r}
+entropy_nsg_states <- df_nsg_shannon_states %>%
+  ggplot(aes(x = mouse, y = shannon_entropy, fill = mouse, color = mouse))+
+  geom_violin(alpha = 0.3)+
+  geom_boxplot(width = 0.2, fill = "white", alpha = 0.7)+
+  geom_jitter(alpha = 0.8)+
+  scale_fill_manual(values = cust_cols[6:10])+
+  scale_color_manual(values = cust_cols[6:10])+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.line.x = element_blank())+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="none")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  coord_cartesian(expand = F, ylim = c(0, 0.60), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 0.60, by = 0.15))+
+  xlab("Mouse")+
+  ylab("Shannon Entropy")+
+  ggtitle("NSG")+
+  theme(plot.title = element_text(hjust = 0.5))
+  #facet_wrap(vars(patient_id), ncol = 5)
+```
+
+```{r}
+ggarrange(entropy_balb_states, entropy_nsg_states, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "none")
+```
+
+```{r}
+balb_plot_counts_states2 <- so_cancer_balb_proc_df_states %>%
+  ggplot(aes(x = mouse, y = total_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  # ggtitle("Balb/C")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "State"))
+  
+nsg_plot_counts_states2 <- so_cancer_nsg_proc_df_states %>%
+  ggplot(aes(x = factor(mouse), y = total_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.8)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_blank())+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(expand = F, ylim = c(0, 3500), xlim = c(0.4,5.5))+
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))+
+  xlab("Mouse")+
+  ylab("Counts")+
+  guides(fill = guide_legend(title = "State"))
+
+balb_plot_freq_states2 <- so_cancer_balb_proc_df_states %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("Cell states frequency")+
+  guides(fill = guide_legend(title = "States"))
+  
+nsg_plot_freq_states2 <- so_cancer_nsg_proc_df_states %>%
+  ggplot(aes(x = mouse, y = prop_abund, fill = states))+
+  geom_bar(stat='identity', width = 0.85)+
+  scale_fill_manual(values = cust_cols)+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  theme(axis.text.x = element_text(size = 5))+
+  theme(legend.position="bottom")+
+  theme(axis.ticks.x = element_blank())+
+  theme(axis.text.y = element_text(size = 5))+
+  theme(axis.title.y = element_text(size = 6))+
+  theme(axis.title.x = element_blank())+
+  theme(plot.title = element_text(hjust = 0.5, size = 8, face = "bold"))+
+  theme(legend.key.size = unit(0.2, 'cm'), 
+        legend.key.height = unit(0.3, 'cm'), 
+        legend.key.width = unit(0.5, 'cm'), 
+        legend.title = element_text(size=6), 
+        legend.text = element_text(size=6))+ 
+  coord_cartesian(xlim = c(1, NA), ylim = c(0, 1))+
+  xlab("Mouse")+
+  ylab("Cell states frequency")+
+  guides(fill = guide_legend(title = "State"))
+
+``` 
+
+```{r}
+counts_plots_states <- ggarrange(balb_plot_counts_states2, nsg_plot_counts_states2, balb_plot_freq_states2, nsg_plot_freq_states2, ncol = 2, nrow = 2, heights = c(0.5,0.5), align = "v", legend = "bottom", common.legend = T)
+entropies_states <- ggarrange(entropy_balb_states, entropy_nsg_states, ncol = 2, nrow = 1, heights = c(0.5,0.5), align = "h", legend = "none")
+ggarrange(entropies_states, counts_plots_states, align = "hv", ncol = 1, nrow = 2, heights = c(0.3, 0.6), widths = c(0.3, 0.3))
+```
+
