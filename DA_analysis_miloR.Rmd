@@ -1,0 +1,133 @@
+---
+title: "Unraveling the immunogenic landscape of TNBC"
+subtitle: "DA Analysis with miloR" 
+author: "Nuria Gendrau-Sanclemente"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    theme: cosmo
+    highlight: pygments
+    df_print: paged
+    code_folding: hide
+    fig_align: center
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: yes
+---
+
+We will perform a Differential Abundance (DA) analysis of the `Milo` object containing scRNA-seq data from Balb/C and NSG tumors. We will use the `miloR` package.
+
+```{r}
+library(miloR)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(dplyr)
+library(patchwork)
+```
+
+```{r}
+milo <- readRDS("milo.rds")
+milo
+```
+
+```{r}
+#Construct the kNN Graph
+milo <- buildGraph(milo, k = 30, d = 30, reduced.dim = "CORRECTED_PCA")
+
+#Define representative neighborhoods on the kNN Graph
+milo <- makeNhoods(milo, prop = 0.1, k = 30, d = 30, refined = TRUE, reduced_dims = "CORRECTED_PCA")
+
+#Plot distribution of neighborhood sizes
+plotNhoodSizeHist(milo)
+```
+
+Count cells in neighborhoods. We need to use cell metadata and specify which column contains sample information. This will add the Milo object a n x m matrix, where "n" is the number of neighborhoods and "m" is the number of experimental samples. Values indicate the number of cells from each sample counted in a neighborhood.
+
+```{r}
+milo <- countCells(milo, meta.data = as.data.frame(colData(milo)), sample = "orig.ident")
+head(nhoodCounts(milo))
+```
+
+```{r}
+#Defining experimental design. Differential Abundance testing
+milo_design <- data.frame(colData(milo))[,c("orig.ident","exp","batch")]
+milo_design %>% head
+```
+
+```{r}
+#Convert batch info from integer to factor
+milo_design$batch <- as.factor(milo_design$batch)
+milo_design <- distinct(milo_design)
+rownames(milo_design) <- make.names(milo_design$orig.ident, unique = TRUE)
+milo_design
+```
+
+Compute neighborhood connectivity. Milo uses an adaptation of the Spatial FDR correction where we correct p-values accounting for the amount of overlap between neighborhoods. Each hypothesis pvalue is weighted by the reciprocal of the kth nearest neighbor distance.
+
+```{r}
+milo <- calcNhoodDistance(milo, d = 30, reduced.dim = "CORRECTED_PCA")
+```
+
+```{r}
+#This calculates Fold-change and corrected pvalue for each neighborhood
+da_results <- testNhoods(milo, design = ~batch + exp, design.df = milo_design, reduced.dim = "CORRECTED_PCA") #Design matrix and nhood counts must be the same dimension
+da_results %>% head 
+```
+
+```{r}
+da_results %>%
+  arrange(SpatialFDR) %>%
+  head()
+```
+
+```{r}
+#Inspection of DA testing results
+ggplot(da_results, aes(PValue)) + geom_histogram(bins = 50)
+```
+
+Visualize test results with a volcano plot, where each point represents a neighborhood, not a cell.
+
+```{r}
+ggplot(da_results, aes(logFC, -log10(SpatialFDR))) +
+  geom_point()+
+  geom_hline(yintercept = 1)
+```
+
+Here each node represents a neighbourhood, while edges indicate how many cells two neighbourhoods have in common. Here the layout of nodes is determined by the position of the index cell in the UMAP embedding of all single-cells. The neighbourhoods displaying singificant DA are colored by their log-Fold Change.
+
+```{r}
+milo <- buildNhoodGraph(milo)
+
+#Plot single-cell UMAP
+umap_pl <- plotReducedDim(milo, dimred = "DSB_WNN_UMAP", colour_by = "exp", text_by = "cell_type", text_size = 3, point_size = 0.5) + 
+  guides(fill = "none")
+
+#Plot neighborhood graph
+nh_graph_pl <- plotNhoodGraphDA(milo, da_results, layout = "DSB_WNN_UMAP", alpha = 0.1)
+
+umap_pl + nh_graph_pl + plot_layout(guides = "collect")
+```
+
+```{r}
+#To visualize if DA is particularly evident in certain cell types
+da_results <- annotateNhoods(milo, da_results, coldata_col = "cell_type")
+da_results %>% head
+```
+
+While neighborhoods tend to be homogeneous, we can define a threshold for `cell_type_fraction` to exclude neighborhoods that are a mix of cell types
+
+```{r}
+ggplot(da_results, aes(cell_type_fraction)) + geom_histogram(bins = 50)
+```
+
+```{r}
+da_results$cell_type <- ifelse(da_results$cell_type_fraction < 0.7, "Mixed", da_results$cell_type)
+```
+
+Visualize the distribution of DA Fold Changes in different cell types. This is actually pretty informative as we can see differences in cell type enrichment in Balb/C vs NSG.
+
+```{r}
+plotDAbeeswarm(da_results, group.by = "cell_type")
+```
